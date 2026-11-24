@@ -28,6 +28,9 @@ const GIST_FALLBACK_URL = "https://gist.githubusercontent.com/crcistianbracho10/
 const ARCHIVO_ESTADO_PERSISTENTE = '/tmp/estado_episodios.json';
 
 const HIMNO_OFICIAL_URL = "https://files.catbox.moe/zvee4n.mp4";
+// Valores necesarios para reproducir fuentes remotas y respetar la ventana del himno.
+const HIMNO_VENTANA_MIN = 10;
+const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 const AJUSTES_DEFECTO = {
     ajusteHorario: true,
