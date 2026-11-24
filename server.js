@@ -4,6 +4,7 @@ const axios = require('axios');
 const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
+const path = require('path');
 
 // Registro en memoria (se muestra en el panel)
 const logBuffer = [];
@@ -16,7 +17,7 @@ console.log = (...args) => {
 };
 
 const app = express();
-const port = process.env.PORT || 8080; // Puerto HTTP para DockHosting (configura PORT si la plataforma asigna otro).
+const port = process.env.PORT || 8080; // blitz.cloud lee el puerto declarado en el Dockerfile (EXPOSE 8080)
 
 const DATASET_REPO_ID = process.env.DATASET_REPO_ID || "cristianbracho904/programacion-tv";
 const DATASET_BRANCH = process.env.DATASET_BRANCH || "main";
@@ -34,7 +35,28 @@ const BANNER_RESPALDO_DEFECTO = "https://i.postimg.cc/v8vXL9BV/images-(1)-(1).pn
 const ARCHIVO_ESTADO_PERSISTENTE = '/tmp/estado_episodios.json';
 const ARCHIVO_CUENTA = '/tmp/cuenta_regresiva.txt';
 const ARCHIVO_CINTILLO = '/tmp/cintillo.txt';
-const HILOS = process.env.FFMPEG_THREADS || ''; // limita los hilos de ffmpeg (útil en servidores chicos)
+const ARCHIVO_AVISO_ACTUAL = '/tmp/aviso_programa_actual.txt';
+const ARCHIVO_AVISO_SIGUIENTE = '/tmp/aviso_programa_siguiente.txt';
+// Hilos de ffmpeg: por defecto, tantos como núcleos REALES tiene el contenedor (ffmpeg ve los de la máquina entera y
+// crea hilos de más, que se estorban entre sí cuando el límite es de 1 núcleo). Se puede forzar con FFMPEG_THREADS.
+const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleosDisponibles())));
+
+// ---------------------------------------------------------------
+// Calidad de salida: SIEMPRE 720p (1280x720). No hay selector ni modo automático.
+// ---------------------------------------------------------------
+const PERFIL = { nombre: '720p', w: 1280, h: 720, kbps: 1000, preset: 'ultrafast' };
+const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0); // kbps; 0 = el del perfil (1000)
+const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96); // kbps
+const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
+// Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
+const SEGUNDOS_CUADRO_CLAVE = 1.5;
+// Logo del canal: el tamaño se cambia con la variable de entorno LOGO_TAMANO (en píxeles).
+// La posición es FIJA (medida sobre el lienzo de 1080p; luego todo se reduce a 720p).
+const LOGO_TAMANO = Math.max(40, parseInt(process.env.LOGO_TAMANO, 10) || 245);
+const LOGO_X = 170; // fijo: distancia al borde
+const LOGO_Y = 75;  // fijo: distancia al borde de arriba
+// Minutos que tiene el himno para arrancar desde su hora de inicio (si no se le pone "fin" en el himno)
+const HIMNO_VENTANA_MIN = 10;
 const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const DIR_OVERRIDES = '/tmp/overrides';
 const FONT_FILE = [
@@ -63,7 +85,6 @@ const AJUSTES_DEFECTO = {
     cintilloVelocidad: 140,
     cintilloColor: "0a50c8",
     modoCodificacion: "ligero",
-    salida: "720p",
     ajusteHorario: true,
     toleranciaMinutos: 3
 };
@@ -72,9 +93,9 @@ let datasetConfig = {
     vivo: [],
     programacion: [],
     himno: [
-        { url: HIMNO_OFICIAL_URL, inicio: "06:00:00", fin: "06:04:30" }, 
-        { url: HIMNO_OFICIAL_URL, inicio: "00:00:00", fin: "00:04:30" }, 
-        { url: HIMNO_OFICIAL_URL, inicio: "18:00:00", fin: "18:04:30" }
+        { url: HIMNO_OFICIAL_URL, inicio: "06:00:00" },
+        { url: HIMNO_OFICIAL_URL, inicio: "00:00:00" },
+        { url: HIMNO_OFICIAL_URL, inicio: "18:00:00" }
     ],
     intros: [],
     publicidad: [],
@@ -97,7 +118,7 @@ const CLAVES_PANEL = {
     publicidad:          { archivo: 'publicidad.txt', tipo: 'lista' },
     intros:              { archivo: 'intros.txt', tipo: 'lista' },
     clasificacion:       { archivo: 'clasificacion.txt', tipo: 'lista' },
-    inicioProg:          { archivo: 'inicioprog.txt', tipo: 'lista' },
+    inicioProg:          { archivo: 'next.txt', tipo: 'lista' }, // "A continuación": [{ "programa": "Nombre exacto", "video": "https://..." }]
     magazine:            { archivo: 'programas/magazine.txt', tipo: 'lista' },
     secretosProsperidad: { archivo: 'programas/secretos-de-prosperidad.txt', tipo: 'lista' },
     cartasTaron:         { archivo: 'programas/cartas-taron.txt', tipo: 'lista' }
@@ -131,7 +152,8 @@ let programaForzado = null;        // índice (en programacion) del programa ini
 const lentos = new Map();          // videos que fueron demasiado lentos: url -> momento (se saltan 1 hora)
 let revision = { estado: 'ninguna', clave: '', total: 0, hechos: 0, filas: [] }; // revisión de formato de videos
 let salud = { speed: null, fps: null, t: 0, ultimoAviso: 0 }; // velocidad de codificación del servidor
-let slotCompletado = "";          // programa cuyo horario ya no admite más episodios (se rellena hasta que termine)
+let slotCompletado = "";          // programa cuyo horario ya no admite más episodios (se rellena hasta que termine
+let estadoAvisosPrograma = { clave: '', segundosAcumulados: 0 }; // tiempo de contenido acumulado del programa, no por video)
 
 function cargarEstadoPersistente() {
     try {
@@ -263,6 +285,12 @@ function convertirSegundos(horaStr) {
     return h * 3600 + m * 60 + s;
 }
 
+function sumarSegundosHora(horaStr, seg) {
+    const t = (convertirSegundos(horaStr) + seg) % 86400;
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(Math.floor(t / 3600))}:${pad(Math.floor((t % 3600) / 60))}:${pad(t % 60)}`;
+}
+
 function estaEnHorario(inicio, fin, horaActualStr) {
     const secInicio = convertirSegundos(inicio);
     const secFin = convertirSegundos(fin);
@@ -282,18 +310,65 @@ app.get('/api/estado', (req, res) => {
     res.json(estadoActualTransmision);
 });
 
+// Diagnóstico público sin revelar credenciales: permite comprobar qué recibió Hugging Face.
+app.get('/api/diagnostico-dataset', (req, res) => {
+    res.json({
+        repositorio: DATASET_REPO_ID,
+        rama: DATASET_BRANCH,
+        tokenConfigurado: Boolean(HF_TOKEN),
+        ultimaSincronizacion: diagnosticoDataset.ultimaSincronizacion,
+        sincronizacionEnCurso: sincronizacionDatasetEnCurso,
+        archivos: diagnosticoDataset.archivos,
+        programasEnHorario: Array.isArray(datasetConfig.programacion) ? datasetConfig.programacion.length : 0,
+        listasDinamicas: Object.keys(listasProgramasPorArchivo),
+        programaEnAire: estadoActualTransmision.programaActual,
+        tituloEnAire: estadoActualTransmision.tituloActual
+    });
+});
+app.get('/api/logs', (req, res) => res.json({ logs: logBuffer.slice(-100) }));
+
 // ---------------------------------------------------------------
 // Dataset (Hugging Face) + cambios hechos desde el panel
 // ---------------------------------------------------------------
+const listasProgramasPorArchivo = Object.create(null);
+const diagnosticoDataset = { ultimaSincronizacion: null, archivos: {} };
+let ultimaFirmaProgramacion = '';
+let ultimoProgramaInformado = '';
+
 async function descargarArchivoDataset(nombreArchivo) {
+    const inicio = Date.now();
     try {
-        const url = `https://huggingface.co/datasets/${DATASET_REPO_ID}/raw/${DATASET_BRANCH}/${nombreArchivo}`;
-        const headers = HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {};
-        const response = await axios.get(url, { headers, timeout: 10000 });
-        return typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+        const ruta = String(nombreArchivo || '').replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/');
+        const url = `https://huggingface.co/datasets/${DATASET_REPO_ID}/raw/${DATASET_BRANCH}/${ruta}?nocache=${Date.now()}`;
+        const headers = {
+            ...(HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {}),
+            'Cache-Control': 'no-cache, no-store, max-age=0',
+            'Pragma': 'no-cache'
+        };
+        const response = await axios.get(url, { headers, timeout: 12000, maxRedirects: 5, validateStatus: () => true });
+        if (response.status < 200 || response.status >= 300) {
+            diagnosticoDataset.archivos[nombreArchivo] = { ok: false, status: response.status, ms: Date.now() - inicio, error: response.status === 401 || response.status === 403 ? 'Token sin permiso, inválido o dataset privado sin acceso' : `HTTP ${response.status}` };
+            console.log(`⚠️ [HF] ${nombreArchivo}: HTTP ${response.status}${response.status === 401 || response.status === 403 ? ' — revisa HF_TOKEN y permisos de lectura' : ''}`);
+            return null;
+        }
+        const datos = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+        diagnosticoDataset.archivos[nombreArchivo] = { ok: true, status: response.status, ms: Date.now() - inicio, elementos: Array.isArray(datos) ? datos.length : (datos && typeof datos === 'object' ? Object.keys(datos).length : 1) };
+        return datos;
     } catch (e) {
+        const status = e.response ? e.response.status : 0;
+        diagnosticoDataset.archivos[nombreArchivo] = { ok: false, status, ms: Date.now() - inicio, error: e.message };
+        console.log(`❌ [HF] Falló ${nombreArchivo}: ${status ? `HTTP ${status}` : e.code || e.message}${status === 401 || status === 403 ? ' — HF_TOKEN inválido o sin permiso de lectura' : ''}`);
         return null;
     }
+}
+
+function normalizarArchivoListaPrograma(valor) {
+    if (typeof valor !== 'string' || !valor.trim()) return null;
+    let ruta = valor.trim().replace(/\\/g, '/').replace(/^\/+/, '');
+    if (ruta.includes('..') || /^https?:\/\//i.test(ruta)) return null;
+    if (!ruta.includes('/')) ruta = `programas/${ruta}`;
+    if (!/\.[a-z0-9]+$/i.test(ruta)) ruta += '.txt';
+    return ruta;
 }
 
 function aplicarConfig(clave, valor) {
@@ -342,30 +417,77 @@ async function guardarEnHuggingFace(archivo, datos) {
     }
 }
 
+let sincronizacionDatasetEnCurso = false;
+
 async function sincronizarDataset() {
-    for (const [clave, info] of Object.entries(CLAVES_PANEL)) {
-        const remoto = await descargarArchivoDataset(info.archivo);
-        const ov = leerOverride(clave);
-        if (ov) {
-            const igual = remoto && JSON.stringify(remoto) === JSON.stringify(ov.datos);
-            if (igual || (ov.hfOk && Date.now() - ov.t > 120000)) {
-                borrarOverride(clave);
-                if (remoto) aplicarConfig(clave, remoto);
-            } else {
-                aplicarConfig(clave, ov.datos); // cambio del panel aún pendiente de reflejarse en HF
-            }
-            continue;
-        }
-        if (remoto) aplicarConfig(clave, remoto);
+    if (sincronizacionDatasetEnCurso) {
+        console.log('ℹ️ [DATASET] Se omitió una consulta: la sincronización anterior todavía está trabajando.');
+        return;
     }
+    sincronizacionDatasetEnCurso = true;
+    const inicioSync = Date.now();
+    if (!HF_TOKEN) console.log('⚠️ [HF] HF_TOKEN no está configurado. Si el dataset es privado, Hugging Face rechazará las descargas. Usa un Access Token, no la contraseña de tu cuenta.');
     try {
-        const gistRes = await axios.get(GIST_FALLBACK_URL);
-        datasetConfig.playlistGist = Array.isArray(gistRes.data) ? gistRes.data : JSON.parse(gistRes.data);
-    } catch (e) {}
-    await actualizarImagenesEvento();
+        const entradas = Object.entries(CLAVES_PANEL);
+        const [remotos, playlistGistRemota] = await Promise.all([
+            Promise.all(entradas.map(async ([clave, info]) => [clave, await descargarArchivoDataset(info.archivo)])),
+            (async () => {
+                try {
+                    const sep = GIST_FALLBACK_URL.includes('?') ? '&' : '?';
+                    const r = await axios.get(`${GIST_FALLBACK_URL}${sep}nocache=${Date.now()}`, { timeout: 12000, headers: { 'Cache-Control': 'no-cache' } });
+                    return Array.isArray(r.data) ? r.data : JSON.parse(r.data);
+                } catch (e) {
+                    console.log(`⚠️ [GIST] No se pudo actualizar la lista: ${e.response ? `HTTP ${e.response.status}` : e.message}`);
+                    return null;
+                }
+            })()
+        ]);
+
+        for (const [clave, remoto] of remotos) {
+            const ov = leerOverride(clave);
+            if (ov) {
+                const igual = remoto && JSON.stringify(remoto) === JSON.stringify(ov.datos);
+                if (igual || (ov.hfOk && Date.now() - ov.t > 120000)) {
+                    borrarOverride(clave);
+                    if (remoto) aplicarConfig(clave, remoto);
+                } else aplicarConfig(clave, ov.datos);
+            } else if (remoto) aplicarConfig(clave, remoto);
+        }
+
+        // Descarga también cualquier lista de programa indicada en programacion.txt,
+        // aunque sea un programa nuevo que no existía cuando se escribió este servidor.
+        const archivosProgramas = [...new Set((datasetConfig.programacion || [])
+            .map(p => normalizarArchivoListaPrograma(p && p.archivo)).filter(Boolean))];
+        const dinamicos = await Promise.all(archivosProgramas.map(async ruta => [ruta, await descargarArchivoDataset(ruta)]));
+        for (const [ruta, datos] of dinamicos) {
+            if (Array.isArray(datos)) {
+                listasProgramasPorArchivo[ruta] = datos;
+            } else {
+                console.log(`⚠️ [PROGRAMAS] No se pudo cargar la lista indicada por programacion.txt: ${ruta}`);
+            }
+        }
+
+        if (playlistGistRemota) datasetConfig.playlistGist = playlistGistRemota;
+        await actualizarImagenesEvento();
+
+        const disponibles = remotos.filter(([, datos]) => datos !== null).length;
+        const firma = JSON.stringify(datasetConfig.programacion || []);
+        if (firma !== ultimaFirmaProgramacion) {
+            ultimaFirmaProgramacion = firma;
+            console.log(`🗓️ [PROGRAMACIÓN] Dataset actualizado: ${(datasetConfig.programacion || []).length} espacios. Listas vinculadas: ${archivosProgramas.join(', ') || 'ninguna'}.`);
+        }
+        diagnosticoDataset.ultimaSincronizacion = new Date().toISOString();
+        console.log(`🔄 [DATASET] Sincronización: ${disponibles}/${entradas.length} archivos base; ${dinamicos.filter(([, d]) => Array.isArray(d)).length}/${dinamicos.length} listas de programas; ${((Date.now() - inicioSync) / 1000).toFixed(1)}s.`);
+    } catch (e) {
+        console.log(`❌ [DATASET] Error general de sincronización: ${e.stack || e.message}`);
+    } finally {
+        sincronizacionDatasetEnCurso = false;
+    }
 }
 
-setInterval(sincronizarDataset, 45000);
+// Primera lectura inmediata y luego actualización cada 40 segundos.
+setTimeout(() => sincronizarDataset(), 1000);
+setInterval(() => sincronizarDataset(), 40000);
 
 // ---------------------------------------------------------------
 // Salida RTMP: manda la misma señal del canal a un servidor externo (sin recodificar)
@@ -389,15 +511,19 @@ function iniciarRTMP() {
     console.log(`📡 [RTMP] Conectando salida RTMP a ${hostRtmp} ...`);
     const proc = spawn('ffmpeg', [
         '-fflags', '+nobuffer+genpts',
+        '-probesize', '500000',
+        '-analyzeduration', '500000',
         '-i', `udp://127.0.0.1:${RTMP_PUENTE_PUERTO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
         '-c:v', 'copy',
         '-c:a', 'copy',
         '-bsf:a', 'aac_adtstoasc',
+        '-flush_packets', '1',
         '-f', 'flv',
         RTMP_URL
     ]);
     procesoRtmp = proc;
     let conectado = false;
+    let yaPublicando = false;
     let lineasMostradas = 0;
     let ultimoEstado = 0;
     const avisoSinSenal = setTimeout(() => {
@@ -406,6 +532,7 @@ function iniciarRTMP() {
     proc.stderr.on('data', (data) => {
         const msg = data.toString().trim();
         if (!msg) return;
+        if (/Already publishing/i.test(msg)) yaPublicando = true;
         if (msg.includes('frame=')) {
             if (!conectado) {
                 conectado = true;
@@ -426,11 +553,100 @@ function iniciarRTMP() {
     });
     proc.on('close', (code, signal) => {
         clearTimeout(avisoSinSenal);
-        console.log(`⚠️ [RTMP] La salida RTMP se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
-        reintentoRtmp = setTimeout(iniciarRTMP, 5000);
+        if (yaPublicando) {
+            console.log('⛔ [RTMP] Opencaster dice "Already publishing": ya hay OTRA transmisión usando esta misma clave (otra copia de esta app, un despliegue anterior que sigue encendido, u otro programa/OBS). Apaga la otra o espera a que su sesión expire. Reintento en 20s.');
+            reintentoRtmp = setTimeout(iniciarRTMP, 20000);
+        } else {
+            console.log(`⚠️ [RTMP] La salida RTMP se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
+            reintentoRtmp = setTimeout(iniciarRTMP, 5000);
+        }
     });
 }
 
+
+// ---------------------------------------------------------------
+// Logo del canal: se busca en varias carpetas (sin importar mayúsculas) y, si no está, se puede bajar de LOGO_URL
+// ---------------------------------------------------------------
+const LOGO_URL = (process.env.LOGO_URL || '').trim();   // cualquier enlace a una imagen (GitHub, Drive, Dropbox, Imgur, etc.)
+let LOGO_PATH = null;
+
+function buscarLogoLocal() {
+    const carpetas = [...new Set([process.cwd(), __dirname, '/app', '/tmp'])];
+    for (const dir of carpetas) {
+        try {
+            const nombre = fs.readdirSync(dir).find(f => f.toLowerCase() === 'canal_c.png');
+            if (nombre) return path.join(dir, nombre);
+        } catch (e) {}
+    }
+    return null;
+}
+
+// Convierte enlaces "de página" (GitHub, Google Drive, Dropbox, Imgur...) en enlaces directos a la imagen
+function enlaceDirectoLogo(u) {
+    u = String(u || '').trim();
+    if (!u) return '';
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) u = 'https://' + u.replace(/^\/+/, '');
+    let m;
+    // GitHub: .../blob/rama/archivo.png  ->  raw.githubusercontent.com/...
+    if ((m = u.match(/^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/]+)\/(?:blob|raw)\/(.+?)(?:\?.*)?$/i))) {
+        return `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}`;
+    }
+    // Google Drive: /file/d/ID/view  o  open?id=ID
+    if ((m = u.match(/drive\.google\.com\/file\/d\/([^/?#]+)/i)) || (m = u.match(/drive\.google\.com\/(?:open|uc)\?(?:[^#]*&)?id=([^&#]+)/i))) {
+        return `https://drive.google.com/uc?export=download&id=${m[1]}`;
+    }
+    // Dropbox: fuerza la descarga directa
+    if (/dropbox\.com/i.test(u)) {
+        return u.replace(/www\.dropbox\.com/i, 'dl.dropboxusercontent.com').replace(/[?&]dl=[01]/i, '');
+    }
+    // Imgur: página de la imagen -> imagen directa
+    if ((m = u.match(/^https?:\/\/(?:www\.)?imgur\.com\/(?!a\/|gallery\/)([A-Za-z0-9]+)\/?$/i))) {
+        return `https://i.imgur.com/${m[1]}.png`;
+    }
+    return corregirUrl(u); // enlaces de tu dataset privado de Hugging Face (pasan por el servidor con el token)
+}
+
+// Detecta el tipo de imagen por sus primeros bytes (no por la extensión del enlace)
+function tipoImagen(buf) {
+    if (buf.length > 12) {
+        if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'png';
+        if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'jpg';
+        if (buf.slice(0, 4).toString() === 'GIF8') return 'gif';
+        if (buf.slice(0, 4).toString() === 'RIFF' && buf.slice(8, 12).toString() === 'WEBP') return 'webp';
+    }
+    return null;
+}
+
+async function prepararLogo() {
+    LOGO_PATH = null;
+    // 1) Si hay LOGO_URL, manda ese enlace (así puedes cambiar el logo solo cambiando el enlace)
+    if (LOGO_URL) {
+        const directo = enlaceDirectoLogo(LOGO_URL);
+        try {
+            const r = await axios.get(directo, {
+                responseType: 'arraybuffer', timeout: 25000, maxContentLength: 15 * 1024 * 1024,
+                headers: { 'User-Agent': UA_NAVEGADOR }, maxRedirects: 5
+            });
+            const buf = Buffer.from(r.data);
+            const tipo = tipoImagen(buf);
+            if (!tipo) throw new Error('el enlace no devuelve una imagen (png, jpg, gif o webp). Usa un enlace directo a la imagen, no a una página.');
+            LOGO_PATH = `/tmp/logo_descargado.${tipo}`;
+            fs.writeFileSync(LOGO_PATH, buf);
+            console.log(`🖼️ [LOGO] Logo descargado desde LOGO_URL (${tipo}, ${buf.length} bytes).`);
+        } catch (e) {
+            console.log(`❌ [LOGO] No se pudo usar LOGO_URL: ${e.response ? 'HTTP ' + e.response.status : e.message}`);
+        }
+    }
+    // 2) Si no hay enlace (o falló), se busca Canal_C.png en el servidor
+    if (!LOGO_PATH) LOGO_PATH = buscarLogoLocal();
+    if (LOGO_PATH) {
+        console.log(`🖼️ [LOGO] Logo en uso: ${LOGO_PATH} (${fs.statSync(LOGO_PATH).size} bytes)`);
+    } else {
+        let lista = '';
+        try { lista = fs.readdirSync(__dirname).slice(0, 40).join(', '); } catch (e) {}
+        console.log(`❌ [LOGO] No hay logo: el canal sale sin logo. Carpeta de trabajo: ${process.cwd()} | Carpeta del código: ${__dirname}\n   Archivos en la carpeta del código: ${lista}\n   Solución: define LOGO_URL con el enlace a tu logo.`);
+    }
+}
 
 // ---------------------------------------------------------------
 // Monitor de CPU y RAM (en vivo, en el registro). Lee el uso REAL del contenedor (cgroup), no el de la máquina completa.
@@ -608,7 +824,7 @@ function getTodaPublicidad() {
         .map(p => corregirUrl(p.video || p.url));
 }
 
-// Busca en inicioprog.txt el video "A continuación" del programa
+// Busca en next.txt el video "A continuación" del programa
 // Formato: [{ "programa": "Nombre exacto del programa", "video": "https://..." }]
 function getVideoInicioProg(nombrePrograma) {
     const lista = datasetConfig.inicioProg;
@@ -638,13 +854,16 @@ function programacionDeHoy() {
     return { dia: nombresDia[dia], total: todos.length, lista };
 }
 
-// Qué lista de episodios usa cada programa (según el campo "archivo" de programacion.txt)
-function claveListaDePrograma(prog) {
-    const n = prog && prog.archivo ? prog.archivo.toLowerCase() : "";
-    if (n.includes("magazine")) return 'magazine';
-    if (n.includes("secretos") || n.includes("prosperidad")) return 'secretosProsperidad';
-    if (n.includes("cartas") || n.includes("taron")) return 'cartasTaron';
-    return datasetConfig.magazine.length > 0 ? 'magazine' : 'cartasTaron';
+// Obtiene la lista de episodios vinculada al campo "archivo" de programacion.txt.
+// Admite archivos nuevos sin tener que agregarlos manualmente al código.
+function obtenerListaDePrograma(prog) {
+    const ruta = normalizarArchivoListaPrograma(prog && prog.archivo);
+    if (ruta && Array.isArray(listasProgramasPorArchivo[ruta])) return listasProgramasPorArchivo[ruta];
+    const n = String(prog && prog.archivo || '').toLowerCase();
+    if (n.includes('magazine')) return datasetConfig.magazine;
+    if (n.includes('secretos') || n.includes('prosperidad')) return datasetConfig.secretosProsperidad;
+    if (n.includes('cartas') || n.includes('taron')) return datasetConfig.cartasTaron;
+    return datasetConfig.magazine.length > 0 ? datasetConfig.magazine : datasetConfig.cartasTaron;
 }
 
 // Decide si hay que saltar el resto de la secuencia (solo ENTRE videos, nunca a mitad de uno)
@@ -669,7 +888,8 @@ function obtenerElementoActualEnEmision() {
     if (datasetConfig.himno && datasetConfig.himno.length > 0) {
         for (let hItem of datasetConfig.himno) {
             let idHimnoUnico = `${fechaHoyStr}-${hItem.inicio}`;
-            if (estaEnHorario(hItem.inicio, hItem.fin, horaCompletaStr)) {
+            const finVentana = hItem.fin || sumarSegundosHora(hItem.inicio, HIMNO_VENTANA_MIN * 60);
+            if (estaEnHorario(hItem.inicio, finVentana, horaCompletaStr)) {
                 if (ultimoHimnoReproducido !== idHimnoUnico) {
                     estadoActualTransmision.tituloActual = "Himno Nacional";
                     estadoActualTransmision.programaActual = "Transmisión Oficial";
@@ -677,8 +897,7 @@ function obtenerElementoActualEnEmision() {
                     return {
                         tipo: 'himno',
                         idUnico: idHimnoUnico,
-                        horaFinBloque: hItem.fin,
-                        corteEstricto: true,
+                        // Sin corte por horario: el himno siempre se reproduce completo
                         secuencia: [{ url: corregirUrl(hItem.url), logo: true, logoDer: false, desc: "Himno Nacional" }]
                     };
                 }
@@ -732,14 +951,14 @@ function obtenerElementoActualEnEmision() {
 
     // Si ya no hay programa en horario (o es otro distinto), se libera la marca de "programa completado"
     if (slotCompletado) {
-        const aun = datasetConfig.programacion.some(p => p.dias.includes(diaSemana) && estaEnHorario(p.inicio, p.fin, horaStr) && `${p.nombre}|${p.inicio}` === slotCompletado);
+        const aun = datasetConfig.programacion.some(p => Array.isArray(p.dias) && p.dias.includes(diaSemana) && estaEnHorario(p.inicio, p.fin, horaStr) && `${p.nombre}|${p.inicio}` === slotCompletado);
         if (!aun) slotCompletado = "";
     }
 
     for (let i = 0; i < datasetConfig.programacion.length; i++) {
         let prog = datasetConfig.programacion[i];
         const esForzado = (programaForzado !== null && i === programaForzado);
-        if (programaForzado !== null ? esForzado : (prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr) && slotCompletado !== `${prog.nombre}|${prog.inicio}`)) {
+        if (programaForzado !== null ? esForzado : (Array.isArray(prog.dias) && prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr) && slotCompletado !== `${prog.nombre}|${prog.inicio}`)) {
             if (esForzado) { programaForzado = null; slotCompletado = ""; }
             let siguienteProg = datasetConfig.programacion[i + 1] ? datasetConfig.programacion[i + 1].nombre : "Transmisión Estelar / Gist";
             estadoActualTransmision.tituloActual = prog.nombre;
@@ -751,7 +970,15 @@ function obtenerElementoActualEnEmision() {
             let videoClasificacion = getVideoClasificacionPorHora(horaStr);
             const anuncios = getTodaPublicidad();
 
-            let listaPrograma = datasetConfig[claveListaDePrograma(prog)];
+            let listaPrograma = obtenerListaDePrograma(prog);
+            const idProgramaLog = `${prog.nombre}|${prog.archivo || '(sin archivo)'}|${Array.isArray(listaPrograma) ? listaPrograma.length : 0}`;
+            if (ultimoProgramaInformado !== idProgramaLog) {
+                ultimoProgramaInformado = idProgramaLog;
+                console.log(`📺 [PROGRAMACIÓN] Seleccionado: "${prog.nombre}" | archivo: ${prog.archivo || 'NO DEFINIDO'} | episodios cargados: ${Array.isArray(listaPrograma) ? listaPrograma.length : 0}.`);
+            }
+            if (!Array.isArray(listaPrograma) || listaPrograma.length === 0) {
+                console.log(`⚠️ [PROGRAMACIÓN] "${prog.nombre}" está en horario, pero su lista de videos está vacía. Revisa el campo archivo en programacion.txt y que ese archivo exista en el dataset.`);
+            }
 
             let claveProg = `${prog.nombre}-${prog.inicio}`;
             if (indicesProgramas[claveProg] === undefined) {
@@ -768,14 +995,14 @@ function obtenerElementoActualEnEmision() {
 
             let secuenciaBloque = [];
 
-            // 1) "A continuación: [programa]" (inicioprog.txt) — solo al comenzar el programa
+            // 1) "A continuación: [programa]" (next.txt) — solo al comenzar el programa
             const claveInicio = `${fechaHoyStr}-${claveProg}`;
             if (ultimoInicioProg !== claveInicio) {
                 const videoInicioProg = getVideoInicioProg(prog.nombre);
                 if (videoInicioProg) {
                     secuenciaBloque.push({ url: videoInicioProg, logo: false, desc: `A continuación: ${prog.nombre}` });
                 } else {
-                    console.log(`ℹ️ [A CONTINUACIÓN] "${prog.nombre}" no tiene video asignado (se agrega en el panel, pestaña "Agregar video").`);
+                    console.log(`ℹ️ [A CONTINUACIÓN] "${prog.nombre}" no tiene video asignado en next.txt (formato: [{ "programa": "${prog.nombre}", "video": "https://..." }]).`);
                 }
                 ultimoInicioProg = claveInicio;
             }
@@ -881,7 +1108,7 @@ function programaProgramadoAhora() {
     const { horaStr } = obtenerTiempoVenezuela();
     const diaSemana = diaSemanaVenezuela();
     for (const prog of datasetConfig.programacion) {
-        if (prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr)) {
+        if (Array.isArray(prog.dias) && prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr)) {
             return { prog, clave: `${prog.nombre}|${prog.inicio}` };
         }
     }
@@ -936,9 +1163,7 @@ function forzarRecalculo() {
 }
 
 async function motorCanalC() {
-    if (!fs.existsSync('Canal_C.png')) {
-        console.log("❌ [LOG CRÍTICO] Falta el archivo 'Canal_C.png' en la raíz del proyecto (en esta imagen). El canal saldrá SIN logo hasta que se despliegue con el archivo incluido.");
-    }
+    await prepararLogo();
     if (RTMP_URL) iniciarRTMP();
     else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
     await sincronizarDataset();
@@ -1014,23 +1239,24 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
-            let xPos = video.logoDer ? "main_w-overlay_w-200" : "200";
+            // Avisos de continuidad: el reloj empieza en el primer video del programa,
+            // se conserva al cambiar de episodio/video y se reinicia al entrar otro programa.
+            let segundosDesdeInicioPrograma = null;
+            if (itemActual.tipo === 'programa_secuencia' && video.permiteBanner && itemActual.claveSlot) {
+                if (estadoAvisosPrograma.clave !== itemActual.claveSlot) {
+                    estadoAvisosPrograma = { clave: itemActual.claveSlot, segundosAcumulados: 0 };
+                    console.log(`📺 [AVISOS] Contador iniciado para "${estadoActualTransmision.programaActual}". Avisos una sola vez al minuto 3.`);
+                }
+                segundosDesdeInicioPrograma = Math.max(0, estadoAvisosPrograma.segundosAcumulados);
+            }
+
             const urlFinal = corregirUrl(video.url);
 
-            // DockHosting: preset ultrafast para reducir carga de CPU.
-            // El escalado fuerza 16:9 (1920x1080 y, si corresponde, 1280x720),
-            // por lo que el material 4:3 se estira horizontalmente y se recodifica.
-            const modoC = (datasetConfig.ajustes || AJUSTES_DEFECTO).modoCodificacion || 'ligero';
-            const scaleFlags = 'fast_bilinear';
-            const presetX264 = 'ultrafast';
-            // Salida 720p: la composición se hace en 1080p y luego se reduce a 1280x720.
-            const salida720 = ((datasetConfig.ajustes || AJUSTES_DEFECTO).salida || '1080p') === '720p';
-            const bitrateV = salida720 ? '1200k' : '1500k';
-            const maxrateV = salida720 ? '1500k' : '1800k';
-            const bufsizeV = salida720 ? '2400k' : '3000k';
             console.log(`\n📺 AIRE: ${video.desc}`);
-            console.log(`🖼️ [LOGO] ${video.logo ? (fs.existsSync('Canal_C.png') ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
+            console.log('⚙️ [COPY] Retransmisión directa: sin recodificar video ni audio, sin logo, filtros, banners ni escalado.');
 
+            // COPY PURO: se conservan los codecs y parámetros originales del video/audio.
+            // No se aplican filtros, overlays, escalado, FPS ni bitrate.
             let ffmpegArgs = [
                 '-reconnect', '1',
                 '-reconnect_streamed', '1',
@@ -1039,78 +1265,20 @@ async function motorCanalC() {
                 '-fflags', '+genpts+ignidx+discardcorrupt',
                 '-err_detect', 'ignore_err',
                 '-user_agent', UA_NAVEGADOR,
-                ...(HILOS ? ['-threads', HILOS] : []),
+                '-probesize', '2M',
+                '-analyzeduration', '2000000',
+                '-thread_queue_size', '512',
                 '-re',
                 '-i', urlFinal,
-                // Si el logo no está en el servidor, se usa un cuadro transparente para que el canal salga igual (sin logo)
-                ...(fs.existsSync('Canal_C.png')
-                    ? ['-i', 'Canal_C.png']
-                    : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
-            ];
-
-            let filterComplex = video.logo ? 
-                `[0:v]fps=24,scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=250:250[logo];[bg][logo]overlay=${xPos}:90[v1];` : 
-                `[0:v]fps=24,scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`;
-
-            let etiqueta = 'v1';
-
-            // Barra de noticias (azul, abajo): sube deslizando y el texto corre de derecha a izquierda.
-            // Va DEBAJO del banner del evento (el banner queda encima y no se mueve).
-            const ajN = datasetConfig.ajustes || AJUSTES_DEFECTO;
-            if (video.permiteBanner && ajN.cintilloActivo && String(ajN.cintilloTexto || '').trim() !== '') {
-                const velN = Math.max(40, numAjuste(ajN.cintilloVelocidad, 140));
-                const colorN = /^[0-9a-fA-F]{6}$/.test(String(ajN.cintilloColor || '')) ? ajN.cintilloColor : '0a50c8';
-                const fuenteN = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                filterComplex += `color=c=0x${colorN}:s=1920x70:r=24[barra];` +
-                                 `[${etiqueta}][barra]overlay=x=0:y='main_h-overlay_h*clip(t-1,0,1)':shortest=1[vn];` +
-                                 `[vn]drawtext=${fuenteN}textfile=${ARCHIVO_CINTILLO}:reload=1:expansion=none:enable='gte(t,2)':x='w-mod((t-2)*${velN},w+tw)':y=main_h-56:fontsize=38:fontcolor=white[vk];`;
-                etiqueta = 'vk';
-            }
-
-            // Cuenta regresiva del evento: solo en programación (episodios, retransmisiones y gist),
-            // nunca en publicidad, intros ni clasificación.
-            const estEv = video.permiteBanner ? verificarEstadoEvento() : null;
-            if (estEv && estEv.tipo === 'proximo') {
-                const aj = datasetConfig.ajustes || AJUSTES_DEFECTO;
-                const S = Math.max(0, numAjuste(aj.segundosAparecer, 10));       // segundos tras iniciar el video
-                const p = `clip(t-${S},0,1)`;                                    // Permanece fijo tras aparecer (no se oculta)
-                const desliza = (x0) => `'${x0}-900*(1-${p})'`;                  // animación de entrada desde la izquierda
-
-                const rutaBanner = imagenesEvento.banner.ruta && fs.existsSync(imagenesEvento.banner.ruta) ? imagenesEvento.banner.ruta : null;
-                const rutaPj = imagenesEvento.personaje.ruta && fs.existsSync(imagenesEvento.personaje.ruta) ? imagenesEvento.personaje.ruta : null;
-                
-                const xCard = rutaPj ? 330 : 50;
-                let idx = 2;
-
-                if (rutaBanner) {
-                    ffmpegArgs.push('-i', rutaBanner);
-                    // Banner más ancho (600) y bajado en Y
-                    filterComplex += `[${idx}:v]scale=600:-2[bnr];[${etiqueta}][bnr]overlay=x=${desliza(xCard)}:y=main_h-overlay_h-20[vb];`;
-                    etiqueta = 'vb';
-                    idx++;
-                }
-                if (rutaPj) {
-                    ffmpegArgs.push('-i', rutaPj);
-                    filterComplex += `[${idx}:v]scale=-2:360[pj];[${etiqueta}][pj]overlay=x=${desliza(30)}:y=main_h-overlay_h-50[vp];`;
-                    etiqueta = 'vp';
-                    idx++;
-                }
-                const fuente = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                // Texto de la cuenta regresiva movido un poco más hacia la derecha (xCard + 50)
-                filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + 50)}:y=main_h-175:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=19[vt];`;
-                etiqueta = 'vt';
-            }
-
-            filterComplex += `[${etiqueta}]${salida720 ? 'scale=1280:720:flags=fast_bilinear,' : ''}format=yuv420p[v];[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
-
-            ffmpegArgs.push('-filter_complex', filterComplex, '-map', '[v]', '-map', '[a]');
-            ffmpegArgs.push(
-                '-c:v', 'libx264', '-preset', presetX264, '-tune', 'zerolatency',
-                ...(HILOS ? ['-threads', HILOS] : []),
-                '-b:v', bitrateV, '-maxrate', maxrateV, '-bufsize', bufsizeV, '-g', '48',
-                '-c:a', 'aac', '-b:a', '96k', '-ac', '2',
+                '-map', '0:v:0?',
+                '-map', '0:a:0?',
+                '-c:v', 'copy',
+                '-c:a', 'copy',
+                '-max_muxing_queue_size', '1024',
+                '-muxdelay', '0',
+                '-flush_packets', '1',
                 '-f', 'mpegts', 'udp://127.0.0.1:9999?pkt_size=1316'
-            );
+            ];
 
             await new Promise((resolve) => {
                 const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
@@ -1173,7 +1341,7 @@ async function motorCanalC() {
                                     salud.ultimoAviso = Date.now();
                                     const carga = os.loadavg()[0].toFixed(1), nuc = os.cpus().length;
                                     console.log(`⚠️ [SEÑAL] "${video.desc}" va a ${v}x (menos de 1x = se congela). Carga del servidor: ${carga} de ${nuc} núcleos. ` +
-                                        (os.loadavg()[0] < nuc * 0.7 ? 'El servidor no está saturado: el problema es ese video o su hosting (revísalo en el panel).' : 'El servidor está saturado: prueba modoCodificacion = ligero y salida = 720p.'));
+                                        (os.loadavg()[0] < nuc * 0.7 ? 'El servidor no está saturado: el problema es ese video o su hosting (revísalo en el panel).' : 'El servidor está saturado: baja BITRATE_VIDEO (ej. 800) o FPS_SALIDA (ej. 20).'));
                                 }
                                 // Lentitud sostenida en un video que no es episodio: se corta y se salta por 1 hora
                                 if (v < 0.5 && Date.now() - inicioProcTs > 10000) {
@@ -1202,7 +1370,7 @@ async function motorCanalC() {
                 });
 
                 const watchdogCongelamiento = setInterval(() => {
-                    if (Date.now() - ultimoFrame > 25000) {
+                    if (Date.now() - ultimoFrame > 15000) {
                         console.log(`⚠️ [WATCHDOG] El video "${video.desc}" se congeló. Forzando reinicio del proceso.`);
                         ffmpegProc.kill('SIGKILL');
                     }
@@ -1218,10 +1386,24 @@ async function motorCanalC() {
                     if (procesoActual === ffmpegProc) procesoActual = null;
                     // Si se reinicia el video a mano, no cuenta como terminado (no avanza el episodio)
                     // Si se reinició a mano o se cortó por horario, el episodio no cuenta como emitido
+                    if (itemActual.tipo === 'programa_secuencia' && video.permiteBanner &&
+                        estadoAvisosPrograma.clave === itemActual.claveSlot && tiempoActual > 0) {
+                        estadoAvisosPrograma.segundosAcumulados += tiempoActual;
+                    }
                     if (!reinicioSolicitado && !cortePorHorario && typeof video.alTerminar === 'function') video.alTerminar();
                     resolve();
                 });
             });
+
+            // Si Hugging Face cambió la parrilla mientras se emitía un video,
+            // recalcula el bloque al terminar este archivo; no espera a consumir toda la secuencia antigua.
+            if (!reinicioSolicitado && itemActual.tipo === 'programa_secuencia' && !itemActual.forzado) {
+                const programadoAhora = programaProgramadoAhora();
+                if (programadoAhora && programadoAhora.clave !== itemActual.claveSlot) {
+                    console.log(`🔁 [PROGRAMACIÓN] Cambio detectado al terminar el video. Sale "${itemActual.claveSlot}" y entra "${programadoAhora.prog.nombre}".`);
+                    break;
+                }
+            }
 
             if (reinicioSolicitado) {
                 reinicioSolicitado = false;
