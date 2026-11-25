@@ -2,8 +2,6 @@ const { spawn } = require('child_process');
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
-const os = require('os');
-const path = require('path');
 
 // Registro de actividad del servidor
 const logBuffer = [];
@@ -23,12 +21,8 @@ const DATASET_BRANCH = process.env.DATASET_BRANCH || "main";
 const HF_TOKEN = process.env.HF_TOKEN || "";
 // Salida RTMP (opcional): URL completa de ingesta, con clave y tokens. Configúrala solo como variable de entorno.
 const RTMP_URL = (process.env.RTMP_URL || "").trim();
-// Una sola entrada FFmpeg alimenta RTMP (si está configurado) y HLS, sin recodificar video.
+// El canal sale SOLO por RTMP (ya no se crean archivos HLS). El codificador manda la señal al puerto local 9999 y de ahí la toma el proceso RTMP.
 const RTMP_PUENTE_PUERTO = 9999;
-const HLS_DIR = process.env.HLS_DIR || path.join(os.tmpdir(), 'canalc-hls');
-const HLS_SEGMENT_SECONDS = 6;
-const HLS_LIST_SIZE = 5;
-fs.mkdirSync(HLS_DIR, { recursive: true });
 
 const GIST_FALLBACK_URL = "https://gist.githubusercontent.com/crcistianbracho10/6e4a07d268460ea807abf28f77c3880e/raw";
 const ARCHIVO_ESTADO_PERSISTENTE = '/tmp/estado_episodios.json';
@@ -173,76 +167,12 @@ function estaEnHorario(inicio, fin, horaActualStr) {
 }
 
 app.get('/', (req, res) => {
-    res.type('html').send(`<!doctype html>
-<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Canal C · Estado</title><style>
-*{box-sizing:border-box}body{margin:0;background:#10131a;color:#eef2f7;font:15px system-ui, sans-serif}
-main{max-width:850px;margin:36px auto;padding:0 18px}.top{display:flex;align-items:center;justify-content:space-between;gap:12px}
-h1{font-size:25px;margin:0}.muted{color:#9aa6b5}.pill{border:1px solid #334155;border-radius:20px;padding:6px 11px;font-size:12px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:22px 0}
-.card{background:#191f2b;border:1px solid #293345;border-radius:13px;padding:17px}.label{color:#9aa6b5;font-size:12px}
-.value{font-size:25px;font-weight:650;margin-top:7px;overflow-wrap:anywhere}.wide{grid-column:1/-1}
-a{color:#8ab4ff;text-decoration:none}a:hover{text-decoration:underline}
-</style></head><body><main>
-<div class="top"><div><h1>Canal C</h1><div class="muted">Panel de transmisión</div></div><span class="pill" id="estado">Comprobando señal…</span></div>
-<section class="grid">
-<div class="card"><div class="label">CPU del proceso</div><div class="value" id="cpu">—</div></div>
-<div class="card"><div class="label">Memoria RAM del proceso</div><div class="value" id="ram">—</div></div>
-<div class="card"><div class="label">Tiempo activo</div><div class="value" id="uptime">—</div></div>
-<div class="card"><div class="label">Programa actual</div><div class="value" id="programa">Cargando…</div></div>
-<div class="card wide"><div class="label">Contenido en emisión</div><div class="value" id="titulo">Cargando…</div><div class="muted" id="hora"></div></div>
-<div class="card wide"><div class="label">Reproductor HLS</div><a href="/hls/index.m3u8">/hls/index.m3u8</a></div>
-</section><div class="muted">Actualización automática cada 5 segundos.</div>
-</main><script>
-async function actualizar(){try{
- const [e,r]=await Promise.all([fetch('/api/estado').then(x=>x.json()),fetch('/api/recursos').then(x=>x.json())]);
- document.getElementById('estado').textContent=r.transmision?'Servidor activo':'Servidor activo · salida pendiente';
- document.getElementById('cpu').textContent=r.cpuPorcentaje.toFixed(1)+'%';
- document.getElementById('ram').textContent=r.memoriaMB.toFixed(1)+' MB';
- document.getElementById('uptime').textContent=r.uptimeTexto;
- document.getElementById('programa').textContent=e.programaActual||'—';
- document.getElementById('titulo').textContent=e.tituloActual||'—';
- document.getElementById('hora').textContent='Hora Venezuela: '+(e.horaVenezuela||'—')+' · A continuación: '+(e.aContinuacion||'—');
- }catch(err){document.getElementById('estado').textContent='No se pudo consultar el estado';}}
-actualizar();setInterval(actualizar,5000);
-</script></body></html>`);
+    res.send('Canal C transmitiendo por RTMP.');
 });
 
 app.get('/api/estado', (req, res) => {
     res.json(estadoActualTransmision);
 });
-
-app.get('/api/recursos', (req, res) => {
-    const uso = process.cpuUsage();
-    const segundos = Math.max(process.uptime(), 1);
-    const cpuPorcentaje = Math.min(100, ((uso.user + uso.system) / 1000000 / segundos) * 100);
-    const memoriaMB = process.memoryUsage().rss / 1024 / 1024;
-    const uptime = Math.floor(process.uptime());
-    const horas = Math.floor(uptime / 3600);
-    const minutos = Math.floor((uptime % 3600) / 60);
-    const segundosRestantes = uptime % 60;
-    res.json({
-        cpuPorcentaje,
-        memoriaMB,
-        uptime,
-        uptimeTexto: horas + 'h ' + minutos + 'm ' + segundosRestantes + 's',
-        transmision: Boolean(procesoRtmp && procesoRtmp.exitCode === null)
-    });
-});
-
-app.use('/hls', express.static(HLS_DIR, {
-    index: false,
-    setHeaders: (res, filePath) => {
-        if (filePath.endsWith('.m3u8')) {
-            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-        } else if (filePath.endsWith('.ts')) {
-            res.setHeader('Content-Type', 'video/mp2t');
-            res.setHeader('Cache-Control', 'public, max-age=30');
-        }
-        res.setHeader('Access-Control-Allow-Origin', '*');
-    }
-}));
 
 // Diagnóstico público sin revelar credenciales: permite comprobar qué recibió Hugging Face.
 app.get('/api/diagnostico-dataset', (req, res) => {
@@ -395,69 +325,65 @@ function ocultarClaveRtmp(texto) {
 }
 
 function iniciarRTMP() {
+    if (!RTMP_URL) return;
     if (reintentoRtmp) { clearTimeout(reintentoRtmp); reintentoRtmp = null; }
     if (procesoRtmp) {
         try { procesoRtmp.removeAllListeners('close'); procesoRtmp.kill('SIGKILL'); } catch (e) {}
     }
-    const salidas = [];
-    if (RTMP_URL) salidas.push(`[f=flv:onfail=ignore]${RTMP_URL}`);
-    const hlsSegmentos = path.join(HLS_DIR, 'segment_%05d.ts');
-    const hlsPlaylist = path.join(HLS_DIR, 'index.m3u8');
-    salidas.push(`[f=hls:hls_time=${HLS_SEGMENT_SECONDS}:hls_list_size=${HLS_LIST_SIZE}:hls_flags=delete_segments+append_list+independent_segments:hls_segment_filename=${hlsSegmentos}]${hlsPlaylist}`);
-    const destino = salidas.join('|');
     let hostRtmp = '';
-    try { hostRtmp = RTMP_URL ? new URL(RTMP_URL).host : 'HLS local'; } catch (e) { hostRtmp = 'RTMP_URL no válida'; }
-    console.log(`📡 [SALIDA] Iniciando salidas ${RTMP_URL ? 'RTMP + HLS' : 'HLS'} (${hostRtmp}) ...`);
+    try { hostRtmp = new URL(RTMP_URL).host; } catch (e) { hostRtmp = '(RTMP_URL no es una URL válida)'; }
+    console.log(`📡 [RTMP] Conectando salida RTMP a ${hostRtmp} ...`);
     const proc = spawn('ffmpeg', [
-        '-hide_banner',
         '-fflags', '+nobuffer+genpts',
         '-probesize', '500000',
         '-analyzeduration', '500000',
         '-i', `udp://127.0.0.1:${RTMP_PUENTE_PUERTO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
-        '-map', '0:v:0?',
-        '-map', '0:a:0?',
         '-c:v', 'copy',
         '-c:a', 'copy',
-        '-max_muxing_queue_size', '1024',
+        '-bsf:a', 'aac_adtstoasc',
         '-flush_packets', '1',
-        '-f', 'tee',
-        destino
+        '-f', 'flv',
+        RTMP_URL
     ]);
     procesoRtmp = proc;
     let conectado = false;
+    let yaPublicando = false;
     let lineasMostradas = 0;
     let ultimoEstado = 0;
     const avisoSinSenal = setTimeout(() => {
-        if (!conectado) console.log('⏳ [SALIDA] Aún no llegan datos de video; revisa que el motor del canal esté enviando señal.');
+        if (!conectado) console.log('⏳ [RTMP] Pasaron 40s y no llegan datos de video al RTMP: o el codificador aún no arranca (revisa los logs de arriba) o el servidor RTMP no respondió.');
     }, 40000);
     proc.stderr.on('data', (data) => {
         const msg = data.toString().trim();
         if (!msg) return;
+        if (/Already publishing/i.test(msg)) yaPublicando = true;
         if (msg.includes('frame=')) {
             if (!conectado) {
                 conectado = true;
-                console.log(`✅ [SALIDA] Señal activa. HLS: /hls/index.m3u8${RTMP_URL ? ' · RTMP conectado' : ''}`);
+                console.log('✅ [RTMP] Transmitiendo al servidor RTMP.');
             }
             if (Date.now() - ultimoEstado > 60000) {
                 ultimoEstado = Date.now();
-                console.log(`📊 [SALIDA] ${msg.split('\\n').pop().replace(/\\s+/g, ' ').slice(0, 160)}`);
+                console.log(`📊 [RTMP] ${msg.split('\n').pop().replace(/\s+/g, ' ').slice(0, 160)}`);
             }
             return;
         }
         if (/decode_slice_header|non-existing PPS|Last message repeated|co located POCs|mmco|reference picture missing|Packet corrupt|no frame/i.test(msg)) return;
-        if (lineasMostradas < 30 || /error|failed|refused|timed out|denied|unauthorized|Input\/output|invalid|not found|Connection/i.test(msg)) {
+        // Muestra lo primero que dice ffmpeg (entrada, salida, errores) para poder diagnosticar; la clave se oculta.
+        if (lineasMostradas < 40 || /error|failed|refused|timed out|denied|unauthorized|Input\/output|invalid|not found|Connection/i.test(msg)) {
             lineasMostradas++;
-            console.log(`[SALIDA] ${ocultarClaveRtmp(msg).slice(0, 300)}`);
+            console.log(`[RTMP] ${ocultarClaveRtmp(msg).slice(0, 300)}`);
         }
-    });
-    proc.on('error', (err) => {
-        clearTimeout(avisoSinSenal);
-        console.log(`❌ [SALIDA] No se pudo iniciar FFmpeg: ${err.message}`);
     });
     proc.on('close', (code, signal) => {
         clearTimeout(avisoSinSenal);
-        console.log(`⚠️ [SALIDA] FFmpeg se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
-        reintentoRtmp = setTimeout(iniciarRTMP, 5000);
+        if (yaPublicando) {
+            console.log('⛔ [RTMP] Opencaster dice "Already publishing": ya hay OTRA transmisión usando esta misma clave (otra copia de esta app, un despliegue anterior que sigue encendido, u otro programa/OBS). Apaga la otra o espera a que su sesión expire. Reintento en 20s.');
+            reintentoRtmp = setTimeout(iniciarRTMP, 20000);
+        } else {
+            console.log(`⚠️ [RTMP] La salida RTMP se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
+            reintentoRtmp = setTimeout(iniciarRTMP, 5000);
+        }
     });
 }
 
@@ -847,8 +773,8 @@ async function emitirEspera() {
 }
 
 async function motorCanalC() {
-    iniciarRTMP();
-    if (!RTMP_URL) console.log('ℹ️ [SALIDA] RTMP_URL no está configurada; se publicará únicamente HLS en /hls/index.m3u8.');
+    if (RTMP_URL) iniciarRTMP();
+    else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
 
     await sincronizarDataset();
 
@@ -902,7 +828,7 @@ async function motorCanalC() {
 
             const urlFinal = corregirUrl(video.url);
             console.log(`\n📺 AIRE: ${video.desc}`);
-            console.log('⚙️ [SALIDA] Video copiado sin recodificar; audio AAC normalizado. Sin logo ni banners.');
+            console.log('⚙️ [SALIDA] Video directo (copy) y audio AAC normalizado a 48 kHz estéreo. Sin logo, banners, cintillo ni filtros gráficos.');
 
             const ffmpegArgs = [
                 '-reconnect', '1',
@@ -1078,4 +1004,4 @@ app.use('/_hf', async (req, res) => {
 app.listen(port, () => {
     console.log(`🚀 Servidor de Canal C corriendo en el puerto ${port}`);
     motorCanalC();
-});
+}); 
