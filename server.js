@@ -2,6 +2,7 @@ const { spawn } = require('child_process');
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
+const os = require('os');
 
 // Registro de actividad del servidor
 const logBuffer = [];
@@ -15,6 +16,106 @@ console.log = (...args) => {
 
 const app = express();
 const port = process.env.PORT || 8080; // blitz.cloud lee el puerto declarado en el Dockerfile (EXPOSE 8080)
+
+
+// ---------------------------------------------------------------
+// Monitor de recursos del servidor (actualización cada 2 segundos)
+// ---------------------------------------------------------------
+let muestraCpuAnterior = null;
+let cpuProcesoAnterior = process.cpuUsage();
+let tiempoProcesoAnterior = process.hrtime.bigint();
+let recursosServidor = {
+    actualizado: null,
+    cpu: { usoPorcentaje: 0, nucleos: os.cpus().length, porNucleo: [] },
+    memoria: { totalBytes: os.totalmem(), libreBytes: os.freemem(), usadaBytes: os.totalmem() - os.freemem(), usoPorcentaje: 0 },
+    proceso: { cpuPorcentaje: 0, memoriaBytes: process.memoryUsage().rss, memoriaPorcentajeSistema: 0 },
+    carga: os.loadavg()
+};
+
+function leerEstadisticasCpuLinux() {
+    try {
+        const lineas = fs.readFileSync('/proc/stat', 'utf8').split('\n');
+        return lineas.filter(l => /^cpu\d*\s/.test(l)).map(linea => {
+            const partes = linea.trim().split(/\s+/);
+            const valores = partes.slice(1).map(Number);
+            const idle = (valores[3] || 0) + (valores[4] || 0);
+            const total = valores.reduce((a, b) => a + b, 0);
+            return { id: partes[0], total, idle };
+        });
+    } catch (e) {
+        return null;
+    }
+}
+
+function calcularPorcentajeCpu(actual, anterior) {
+    if (!anterior) return 0;
+    const total = actual.total - anterior.total;
+    const idle = actual.idle - anterior.idle;
+    if (total <= 0) return 0;
+    return Math.max(0, Math.min(100, ((total - idle) / total) * 100));
+}
+
+function actualizarRecursosServidor() {
+    const ahoraCpu = leerEstadisticasCpuLinux();
+    const cpus = os.cpus();
+    let usoTotal = 0;
+    let porNucleo = [];
+
+    if (ahoraCpu && muestraCpuAnterior) {
+        const anteriores = new Map(muestraCpuAnterior.map(x => [x.id, x]));
+        const muestras = ahoraCpu.filter(x => x.id !== 'cpu');
+        porNucleo = muestras.map((actual, i) => ({
+            nucleo: i + 1,
+            usoPorcentaje: Number(calcularPorcentajeCpu(actual, anteriores.get(actual.id)).toFixed(1))
+        }));
+        const totalActual = ahoraCpu.find(x => x.id === 'cpu');
+        const totalAnterior = muestraCpuAnterior.find(x => x.id === 'cpu');
+        usoTotal = Number(calcularPorcentajeCpu(totalActual, totalAnterior).toFixed(1));
+    } else if (cpus.length) {
+        porNucleo = cpus.map((_, i) => ({ nucleo: i + 1, usoPorcentaje: 0 }));
+    }
+    muestraCpuAnterior = ahoraCpu;
+
+    const memoriaTotal = os.totalmem();
+    const memoriaLibre = os.freemem();
+    const memoriaUsada = memoriaTotal - memoriaLibre;
+    const cpuProcesoActual = process.cpuUsage();
+    const tiempoActual = process.hrtime.bigint();
+    const deltaCpuMicro = (cpuProcesoActual.user - cpuProcesoAnterior.user) + (cpuProcesoActual.system - cpuProcesoAnterior.system);
+    const deltaTiempoMicro = Number(tiempoActual - tiempoProcesoAnterior) / 1000;
+    const cpuProceso = deltaTiempoMicro > 0 ? Math.max(0, (deltaCpuMicro / deltaTiempoMicro) * 100) : 0;
+    const memoriaProceso = process.memoryUsage();
+
+    recursosServidor = {
+        actualizado: new Date().toISOString(),
+        cpu: {
+            usoPorcentaje: usoTotal,
+            nucleos: cpus.length,
+            modelo: cpus[0] ? cpus[0].model : 'No disponible',
+            porNucleo
+        },
+        memoria: {
+            totalBytes: memoriaTotal,
+            libreBytes: memoriaLibre,
+            usadaBytes: memoriaUsada,
+            usoPorcentaje: memoriaTotal ? Number((memoriaUsada / memoriaTotal * 100).toFixed(1)) : 0
+        },
+        proceso: {
+            cpuPorcentaje: Number(cpuProceso.toFixed(1)),
+            memoriaBytes: memoriaProceso.rss,
+            memoriaHeapBytes: memoriaProceso.heapUsed,
+            memoriaPorcentajeSistema: memoriaTotal ? Number((memoriaProceso.rss / memoriaTotal * 100).toFixed(2)) : 0
+        },
+        carga: os.loadavg()
+    };
+
+    cpuProcesoAnterior = cpuProcesoActual;
+    tiempoProcesoAnterior = tiempoActual;
+}
+
+// Primera muestra y refresco continuo cada 2 segundos.
+actualizarRecursosServidor();
+setInterval(actualizarRecursosServidor, 2000).unref();
 
 const DATASET_REPO_ID = process.env.DATASET_REPO_ID || "cristianbracho904/programacion-tv";
 const DATASET_BRANCH = process.env.DATASET_BRANCH || "main";
@@ -172,6 +273,13 @@ app.get('/', (req, res) => {
 
 app.get('/api/estado', (req, res) => {
     res.json(estadoActualTransmision);
+});
+
+
+// Estadísticas del equipo y del proceso, actualizadas cada 2 segundos.
+app.get('/api/recursos', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json(recursosServidor);
 });
 
 // Diagnóstico público sin revelar credenciales: permite comprobar qué recibió Hugging Face.
@@ -1005,3 +1113,4 @@ app.listen(port, () => {
     console.log(`🚀 Servidor de Canal C corriendo en el puerto ${port}`);
     motorCanalC();
 }); 
+ 
